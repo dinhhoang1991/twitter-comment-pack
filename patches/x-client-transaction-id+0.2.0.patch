@@ -1,0 +1,31 @@
+diff --git a/node_modules/x-client-transaction-id/esm/transaction.js b/node_modules/x-client-transaction-id/esm/transaction.js
+index e644d4d..d62cc2b 100644
+--- a/node_modules/x-client-transaction-id/esm/transaction.js
++++ b/node_modules/x-client-transaction-id/esm/transaction.js
+@@ -12,13 +12,22 @@ import { floatToHex, isOdd } from "./utils.js";
+ import { decodeBase64, encodeBase64 } from "./deps/jsr.io/@std/encoding/1.0.10/mod.js";
+ const ON_DEMAND_CHUNK_NAME = "ondemand.s";
+ const INDICES_REGEX = /\(\w\[(\d{1,2})\],\s*16\)/g;
+-const ON_DEMAND_FILE_HASH_REGEX = /(\d+):\s*["']ondemand\.s["'][\s\S]*?\}\[e\]\s*\|\|\s*e\)\s*\+\s*["']\.["']\s*\+\s*\{[\s\S]*?\b\1:\s*["']([a-zA-Z0-9_-]+)["']/s;
++const ON_DEMAND_FILE_HASH_REGEX = /(\d+):\s*["']ondemand\.s["'][\s\S]*?\}\)?\[e\]\s*\|\|\s*e\)\s*\+\s*["']\.["']\s*\+\s*\(?\{[\s\S]*?\b\1:\s*["']([a-zA-Z0-9_-]+)["']/s;
+ function resolveOnDemandFileUrlFromRuntime(runtimeSource) {
+     const onDemandFileMatch = ON_DEMAND_FILE_HASH_REGEX.exec(runtimeSource);
+-    if (!onDemandFileMatch) {
+-        return null;
++    if (onDemandFileMatch) {
++        return `https://abs.twimg.com/responsive-web/client-web/${ON_DEMAND_CHUNK_NAME}.${onDemandFileMatch[2]}a.js`;
+     }
+-    return `https://abs.twimg.com/responsive-web/client-web/${ON_DEMAND_CHUNK_NAME}.${onDemandFileMatch[2]}a.js`;
++    const idMatch = /(\d+):\s*["']ondemand\.s["']/.exec(runtimeSource);
++    if (!idMatch) return null;
++    const id = idMatch[1];
++    const hashRe = new RegExp("\\b" + id + ":\\s*[\"']([a-zA-Z0-9_-]+)[\"']", "g");
++    let hit, hash;
++    while ((hit = hashRe.exec(runtimeSource)) !== null) {
++        if (hit[1] !== "ondemand.s") { hash = hit[1]; }
++    }
++    if (!hash) return null;
++    return `https://abs.twimg.com/responsive-web/client-web/${ON_DEMAND_CHUNK_NAME}.${hash}a.js`;
+ }
+ /**
+  * Main class responsible for generating client transaction IDs

@@ -1,0 +1,21 @@
+{
+  "name": "twitter-comment-pack",
+  "version": "1.0.0",
+  "description": "Self-contained Twitter auto-comment toolkit. List + amplify + hybrid modes, multi-language AI replies.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "setup": "node setup-wizard.mjs",
+    "install-service": "node scripts/install-autostart.mjs",
+    "postinstall": "patch-package"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "jsdom": "^26.0.0",
+    "patch-package": "^8.0.1",
+    "x-client-transaction-id": "0.2.0"
+  }
+}
