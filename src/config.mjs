@@ -17,7 +17,7 @@ export function loadConfig() {
 function validate(cfg) {
   if (!cfg.cookiesFile) throw new Error('config.cookiesFile missing');
   if (!fs.existsSync(cfg.cookiesFile)) throw new Error(`Cookies file not found: ${cfg.cookiesFile}`);
-  if (!cfg.mode || !['A', 'B', 'C'].includes(cfg.mode)) throw new Error('config.mode must be A, B, or C');
+  if (!cfg.mode || !['A', 'B', 'C', 'D'].includes(cfg.mode)) throw new Error('config.mode must be A, B, C, or D');
   if (!cfg.ai || !cfg.ai.provider || !cfg.ai.apiKey) throw new Error('config.ai.{provider,apiKey} required');
   if (!cfg.commentsPerHour) cfg.commentsPerHour = 15;
 }

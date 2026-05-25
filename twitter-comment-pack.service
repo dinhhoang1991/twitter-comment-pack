@@ -1,0 +1,22 @@
+[Unit]
+Description=Twitter Comment Pack (Mode D - Keyword Search)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dinhhoangg1991/twitter-comment-pack
+Environment=PATH=/home/dinhhoangg1991/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/dinhhoangg1991/.local/bin/node src/index.mjs
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/dinhhoangg1991/twitter-comment-pack/data/run.log
+StandardError=append:/home/dinhhoangg1991/twitter-comment-pack/data/error.log
+LimitNPROC=512
+LimitNOFILE=65536
+PrivateTmp=yes
+NoNewPrivileges=yes
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

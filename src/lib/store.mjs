@@ -9,13 +9,26 @@ export function initStore(dbPath = 'data/store.db') {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
+  try { db.exec('ALTER TABLE commented ADD COLUMN comment_count INTEGER DEFAULT 1'); } catch {}
   db.exec(`
+
     CREATE TABLE IF NOT EXISTS commented (
       tweet_id TEXT PRIMARY KEY,
       ts INTEGER NOT NULL,
-      author TEXT
+      author TEXT,
+      comment_count INTEGER DEFAULT 1
     );
     CREATE INDEX IF NOT EXISTS idx_commented_ts ON commented(ts);
+
+    CREATE TABLE IF NOT EXISTS viral_tweets (
+      tweet_id TEXT PRIMARY KEY,
+      first_seen_ts INTEGER NOT NULL,
+      last_seen_ts INTEGER NOT NULL,
+      seen_count INTEGER DEFAULT 1,
+      first_reply_count INTEGER,
+      latest_reply_count INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_viral_latest ON viral_tweets(seen_count DESC, latest_reply_count DESC);
 
     CREATE TABLE IF NOT EXISTS warmup_state (
       target TEXT NOT NULL,
@@ -29,19 +42,61 @@ export function initStore(dbPath = 'data/store.db') {
       k TEXT PRIMARY KEY,
       v TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS engaged_users (
+      user_id TEXT PRIMARY KEY,
+      username TEXT,
+      last_interact_ts INTEGER NOT NULL,
+      interaction_count INTEGER DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS follows (
+      user_id TEXT PRIMARY KEY,
+      username TEXT,
+      followed_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mutuals (
+      user_id TEXT PRIMARY KEY,
+      username TEXT,
+      discovered_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS trend_words (
+      word TEXT PRIMARY KEY,
+      cnt INTEGER DEFAULT 1,
+      last_seen INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS my_replies (
+      tweet_id TEXT PRIMARY KEY,
+      root_tweet_id TEXT,
+      ts INTEGER NOT NULL
+    );
   `);
   return db;
 }
 
+export function getCommentCount(tweetId) {
+  if (!db) return 0;
+  const row = db.prepare('SELECT comment_count FROM commented WHERE tweet_id = ?').get(tweetId);
+  return row ? row.comment_count : 0;
+}
+
 export function alreadyCommented(tweetId) {
   if (!db) return false;
-  const row = db.prepare('SELECT 1 FROM commented WHERE tweet_id = ?').get(tweetId);
-  return !!row;
+  return getCommentCount(tweetId) >= 1;
 }
 
 export function markCommented(tweetId, author = '') {
-  db.prepare('INSERT OR REPLACE INTO commented(tweet_id, ts, author) VALUES(?, ?, ?)')
-    .run(tweetId, Date.now(), author);
+  db.prepare(`
+    INSERT INTO commented(tweet_id, ts, author, comment_count)
+    VALUES(?, ?, ?, 1)
+    ON CONFLICT(tweet_id) DO UPDATE SET
+      ts = excluded.ts,
+      comment_count = comment_count + 1,
+      author = COALESCE(excluded.author, author)
+  `).run(tweetId, Date.now(), author);
 }
 
 export function commentsInLastHour() {
@@ -73,4 +128,154 @@ export function getMeta(k) {
 
 export function setMeta(k, v) {
   db.prepare('INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)').run(k, String(v));
+}
+
+export function isEngagedUser(userId) {
+  if (!db || !userId) return false;
+  const row = db.prepare('SELECT 1 FROM engaged_users WHERE user_id = ?').get(userId);
+  return !!row;
+}
+
+export function markUserEngaged(userId, username = '') {
+  if (!db || !userId) return;
+  db.prepare(`
+    INSERT INTO engaged_users (user_id, username, last_interact_ts, interaction_count)
+    VALUES (?, ?, ?, 1)
+    ON CONFLICT(user_id) DO UPDATE SET
+      last_interact_ts = excluded.last_interact_ts,
+      interaction_count = interaction_count + 1,
+      username = COALESCE(excluded.username, username)
+  `).run(userId, username, Date.now());
+}
+
+export function getEngagedUserCount() {
+  if (!db) return 0;
+  const row = db.prepare('SELECT COUNT(*) AS c FROM engaged_users').get();
+  return row.c;
+}
+
+// Viral tweet tracking
+export function seeViralTweet(tweetId, replyCount) {
+  if (!db) return;
+  db.prepare(`
+    INSERT INTO viral_tweets(tweet_id, first_seen_ts, last_seen_ts, seen_count, first_reply_count, latest_reply_count)
+    VALUES (?, ?, ?, 1, ?, ?)
+    ON CONFLICT(tweet_id) DO UPDATE SET
+      last_seen_ts = ?,
+      seen_count = seen_count + 1,
+      latest_reply_count = ?
+  `).run(tweetId, Date.now(), Date.now(), replyCount, replyCount, Date.now(), replyCount);
+}
+
+export function getViralTweets(minSeen = 3, minGrowth = 5) {
+  if (!db) return [];
+  const rows = db.prepare(`
+    SELECT tweet_id, first_seen_ts, seen_count,
+           COALESCE(latest_reply_count, 0) - COALESCE(first_reply_count, 0) AS growth
+    FROM viral_tweets
+    WHERE seen_count >= ?
+      AND first_seen_ts > ?
+    ORDER BY growth DESC, seen_count DESC
+    LIMIT 20
+  `).all(minSeen, Date.now() - 48 * 60 * 60 * 1000);
+  return rows;
+}
+
+export function cleanupOldViralTweets() {
+  if (!db) return;
+  db.prepare('DELETE FROM viral_tweets WHERE last_seen_ts < ?').run(Date.now() - 48 * 60 * 60 * 1000);
+}
+
+export function getViralStats() {
+  if (!db) return null;
+  const row = db.prepare(`
+    SELECT COUNT(*) AS total, COALESCE(SUM(growth),0) AS total_growth
+    FROM viral_tweets WHERE seen_count >= 3
+  `).get();
+  return row;
+}
+
+// Warmup tracking
+export function isWarmedUp(target) {
+  if (!db) return false;
+  return !!db.prepare('SELECT 1 FROM warmed_up WHERE user_id = ?').get(target);
+}
+
+export function markWarmedUp(target) {
+  if (!db) return;
+  db.prepare('INSERT OR IGNORE INTO warmed_up(user_id) VALUES(?)').run(target);
+}
+
+export function trackFollow(userId, username) {
+  if (!db || !userId) return;
+  db.prepare('INSERT OR IGNORE INTO follows(user_id, username, followed_at) VALUES(?, ?, ?)')
+    .run(userId, username || '', Date.now());
+}
+
+export function isFollowing(userId) {
+  if (!db || !userId) return false;
+  const row = db.prepare('SELECT 1 FROM follows WHERE user_id = ?').get(userId);
+  return !!row;
+}
+
+export function getStaleFollows(days = 3) {
+  if (!db) return [];
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  return db.prepare('SELECT user_id, username FROM follows WHERE followed_at < ?').all(cutoff);
+}
+
+export function removeFollowRecord(userId) {
+  if (!db) return;
+  db.prepare('DELETE FROM follows WHERE user_id = ?').run(userId);
+}
+
+export function markMutual(userId, username) {
+  if (!db || !userId) return;
+  db.prepare('INSERT OR IGNORE INTO mutuals(user_id, username, discovered_at) VALUES(?, ?, ?)')
+    .run(userId, username || '', Date.now());
+}
+
+export function isMutual(userId) {
+  if (!db || !userId) return false;
+  return !!db.prepare('SELECT 1 FROM mutuals WHERE user_id = ?').get(userId);
+}
+
+export function getMutuals() {
+  if (!db) return [];
+  return db.prepare('SELECT user_id, username FROM mutuals ORDER BY discovered_at DESC LIMIT 50').all();
+}
+
+export function getMutualCount() {
+  if (!db) return 0;
+  return db.prepare('SELECT COUNT(*) AS c FROM mutuals').get().c;
+}
+
+export function getTrendKeywords() {
+  if (!db) return [];
+  const since = Date.now() - 60 * 60 * 1000;
+  return db.prepare('SELECT word, cnt FROM trend_words WHERE last_seen > ? ORDER BY cnt DESC LIMIT 10').all(since);
+}
+
+export function bumpTrendWord(word) {
+  if (!db || !word || word.length < 3) return;
+  db.prepare(`
+    INSERT INTO trend_words(word, cnt, last_seen) VALUES(?, 1, ?)
+    ON CONFLICT(word) DO UPDATE SET cnt = cnt + 1, last_seen = ?
+  `).run(word.toLowerCase(), Date.now(), Date.now());
+}
+
+export function cleanupTrendWords() {
+  if (!db) return;
+  db.prepare('DELETE FROM trend_words WHERE last_seen < ?').run(Date.now() - 2 * 60 * 60 * 1000);
+}
+
+export function trackMyReply(replyTweetId, rootTweetId) {
+  if (!db || !replyTweetId) return;
+  db.prepare('INSERT OR IGNORE INTO my_replies(tweet_id, root_tweet_id, ts) VALUES(?, ?, ?)')
+    .run(replyTweetId, rootTweetId || null, Date.now());
+}
+
+export function isReplyToMyComment(inReplyToTweetId) {
+  if (!db || !inReplyToTweetId) return false;
+  return !!db.prepare('SELECT 1 FROM my_replies WHERE tweet_id = ?').get(inReplyToTweetId);
 }

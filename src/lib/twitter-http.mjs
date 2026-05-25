@@ -177,9 +177,17 @@ function twitterCreatedAtToIso(s) {
 
 function parseTweetEntry(entry) {
   const tweet = entry?.content?.itemContent?.tweet_results?.result;
-  if (!tweet) return null;
+  if (!tweet) {
+    const ic = entry?.content?.itemContent || {};
+    const ik = Object.keys(ic).slice(0, 5);
+    console.error('[DEBUG parseTweetEntry] no tweet_result, itemContent keys:', ik, 'entryType:', entry?.content?.entryType);
+    return null;
+  }
   const legacy = tweet.legacy || tweet.tweet?.legacy;
-  if (!legacy) return null;
+  if (!legacy) {
+    console.error('[DEBUG parseTweetEntry] no legacy, tweet keys:', Object.keys(tweet).slice(0, 10));
+    return null;
+  }
   const userResult =
     tweet.core?.user_results?.result ||
     tweet.tweet?.core?.user_results?.result;
@@ -187,14 +195,30 @@ function parseTweetEntry(entry) {
     userResult?.core?.screen_name ||
     userResult?.legacy?.screen_name ||
     'unknown';
+  const authorUserId =
+    userResult?.rest_id || null;
+  const followersCount =
+    userResult?.legacy?.followers_count ||
+    userResult?.core?.followers_count ||
+    0;
+  const verified =
+    userResult?.legacy?.verified ||
+    userResult?.is_blue_verified ||
+    false;
+  const authorCreatedAt = userResult?.legacy?.created_at || null;
   return {
     id: tweet.rest_id || tweet.tweet?.rest_id || legacy.id_str,
+    text: legacy.full_text || '',
     fullText: legacy.full_text || '',
     author,
+    author_user_id: authorUserId,
     createdAt: twitterCreatedAtToIso(legacy.created_at),
     lang: legacy.lang,
     inReplyToStatusId: legacy.in_reply_to_status_id_str || null,
     isRetweet: Boolean(legacy.retweeted_status_result) || Boolean(legacy.retweeted_status_id_str),
+    author_followers_count: followersCount,
+    author_verified: verified,
+    author_created_at: authorCreatedAt,
   };
 }
 
@@ -370,6 +394,13 @@ export async function favoriteTweet(tweetId, cookiesFilePath) {
   return true;
 }
 
+export async function getMyFollowers(cookiesFilePath, count = 50) {
+  // Basic implementation - gets authenticated user's followers
+  const queryId = 'o5iC1m6v4e1z3Xz3Xz3Xz3'; // placeholder, needs real query ID
+  // For now, return empty - full implementation requires proper GraphQL query
+  return [];
+}
+
 export async function followUser(userId, cookiesFilePath) {
   const apiPath = `/i/api/1.1/friendships/create.json`;
   const { cookieStr, ct0 } = readCookies(cookiesFilePath);
@@ -395,6 +426,31 @@ export async function followUser(userId, cookiesFilePath) {
   return JSON.parse(result.body);
 }
 
+export async function unfollowUser(userId, cookiesFilePath) {
+  const apiPath = `/i/api/1.1/friendships/destroy.json`;
+  const { cookieStr, ct0 } = readCookies(cookiesFilePath);
+  const ct = await getClientTransaction();
+  const txId = await ct.generateTransactionId('POST', apiPath);
+  const headers = {
+    authorization: BEARER,
+    cookie: cookieStr,
+    'x-csrf-token': ct0,
+    'x-client-transaction-id': txId,
+    'x-twitter-active-user': 'yes',
+    'x-twitter-auth-type': 'OAuth2Session',
+    'content-type': 'application/x-www-form-urlencoded',
+    'user-agent': UA,
+    accept: '*/*',
+    referer: 'https://x.com/',
+    origin: 'https://x.com',
+  };
+  const payload = `user_id=${encodeURIComponent(userId)}`;
+  const result = await httpRequest('POST', 'x.com', apiPath, headers, payload);
+  if (result.status === 429 || result.status === 403) throw new Error(`RATE_LIMITED ${result.status}`);
+  if (result.status !== 200) throw new Error(`Unfollow failed (${result.status})`);
+  return JSON.parse(result.body);
+}
+
 export async function getFriendship(username, cookiesFilePath) {
   const apiPath = `/i/api/1.1/friendships/show.json?screen_name=${encodeURIComponent(username)}`;
   const { cookieStr, ct0 } = readCookies(cookiesFilePath);
@@ -415,4 +471,54 @@ export async function getFriendship(username, cookiesFilePath) {
   const result = await httpRequest('GET', 'x.com', apiPath, headers);
   if (result.status !== 200) return null;
   return JSON.parse(result.body);
+}
+
+export async function uploadMedia(imageBuffer, cookiesFilePath) {
+  const { cookieStr, ct0 } = readCookies(cookiesFilePath);
+  const ct = await getClientTransaction();
+  const txId = await ct.generateTransactionId('POST', '/i/media/upload.json');
+  const boundary = '----WebKitFormBoundary' + Math.random().toString(36).slice(2);
+  const CRLF = '\r\n';
+  const parts = [
+    '--' + boundary,
+    'Content-Disposition: form-data; name="media"; filename="chart.png"',
+    'Content-Type: image/png',
+    '',
+    '',
+  ];
+  const header = Buffer.from(parts.join(CRLF), 'utf8');
+  const footer = Buffer.from(CRLF + '--' + boundary + '--' + CRLF, 'utf8');
+  const body = Buffer.concat([header, imageBuffer, footer]);
+  const headers = {
+    authorization: BEARER,
+    cookie: cookieStr,
+    'x-csrf-token': ct0,
+    'x-client-transaction-id': txId,
+    'x-twitter-active-user': 'yes',
+    'x-twitter-auth-type': 'OAuth2Session',
+    'content-type': 'multipart/form-data; boundary=' + boundary,
+    'user-agent': UA,
+    accept: '*/*',
+    referer: 'https://x.com/',
+    origin: 'https://x.com',
+  };
+  const result = await httpRequestRaw('POST', 'x.com', '/i/media/upload.json', headers, body);
+  if (result.status === 429 || result.status === 403) throw new Error(`RATE_LIMITED ${result.status}`);
+  if (result.status !== 200) throw new Error(`Upload failed (${result.status})`);
+  return JSON.parse(result.body);
+}
+
+async function httpRequestRaw(method, host, path, headers, body) {
+  const https = await import('https');
+  return new Promise((resolve, reject) => {
+    const req = https.request({ hostname: host, path, method, headers, timeout: 30000 }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Upload timeout')); });
+    req.write(body);
+    req.end();
+  });
 }
