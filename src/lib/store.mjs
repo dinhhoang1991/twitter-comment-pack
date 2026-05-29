@@ -73,6 +73,40 @@ export function initStore(dbPath = 'data/store.db') {
       root_tweet_id TEXT,
       ts INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS reply_feedback (
+      tweet_id TEXT PRIMARY KEY,
+      engagement_style TEXT,
+      persona TEXT,
+      likes_got INTEGER DEFAULT 0,
+      replies_got INTEGER DEFAULT 0,
+      checked_at INTEGER,
+      posted_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_feedback_checked ON reply_feedback(checked_at);
+    CREATE INDEX IF NOT EXISTS idx_feedback_style ON reply_feedback(engagement_style);
+
+    CREATE TABLE IF NOT EXISTS auto_post_feedback (
+      tweet_id TEXT PRIMARY KEY,
+      token_ticker TEXT,
+      token_name TEXT,
+      lang TEXT,
+      thread_size INTEGER,
+      likes_got INTEGER DEFAULT 0,
+      replies_got INTEGER DEFAULT 0,
+      retweets_got INTEGER DEFAULT 0,
+      quotes_got INTEGER DEFAULT 0,
+      checked_at INTEGER,
+      posted_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_apf_checked ON auto_post_feedback(checked_at);
+
+    CREATE TABLE IF NOT EXISTS followers (
+      user_id TEXT PRIMARY KEY,
+      username TEXT,
+      discovered_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_followers_user ON followers(username);
   `);
   return db;
 }
@@ -278,4 +312,94 @@ export function trackMyReply(replyTweetId, rootTweetId) {
 export function isReplyToMyComment(inReplyToTweetId) {
   if (!db || !inReplyToTweetId) return false;
   return !!db.prepare('SELECT 1 FROM my_replies WHERE tweet_id = ?').get(inReplyToTweetId);
+}
+
+export function trackReplyFeedback(tweetId, engagementStyle, persona) {
+  if (!db || !tweetId) return;
+  db.prepare(`INSERT OR IGNORE INTO reply_feedback(tweet_id, engagement_style, persona, posted_at)
+    VALUES(?, ?, ?, ?)`).run(tweetId, engagementStyle || '', persona || '', Date.now());
+}
+
+export function updateReplyFeedback(tweetId, likes, replies) {
+  if (!db || !tweetId) return;
+  db.prepare(`UPDATE reply_feedback SET likes_got=?, replies_got=?, checked_at=? WHERE tweet_id=?`)
+    .run(likes || 0, replies || 0, Date.now(), tweetId);
+}
+
+export function getUncheckedFeedback(minAgeMs = 3600000, limit = 10) {
+  if (!db) return [];
+  const cutoff = Date.now() - minAgeMs;
+  return db.prepare(`SELECT tweet_id, engagement_style, persona FROM reply_feedback
+    WHERE (checked_at IS NULL OR checked_at < ?) AND posted_at < ?
+    ORDER BY posted_at ASC LIMIT ?`).all(cutoff, cutoff, limit);
+}
+
+export function getBestStyles(minSamples = 3) {
+  if (!db) return [];
+  return db.prepare(`SELECT engagement_style, COUNT(*) as n,
+    CAST(SUM(likes_got + replies_got * 2) AS REAL) / MAX(COUNT(*), 1) as score
+    FROM reply_feedback WHERE checked_at IS NOT NULL
+    GROUP BY engagement_style HAVING n >= ? ORDER BY score DESC`).all(minSamples);
+}
+
+export function getBestPersonas(minSamples = 3) {
+  if (!db) return [];
+  return db.prepare(`SELECT persona, COUNT(*) as n,
+    CAST(SUM(likes_got + replies_got * 2) AS REAL) / MAX(COUNT(*), 1) as score
+    FROM reply_feedback WHERE checked_at IS NOT NULL AND persona != ''
+    GROUP BY persona HAVING n >= ? ORDER BY score DESC`).all(minSamples);
+}
+
+export function cleanupOldFeedback(maxAgeMs = 7 * 24 * 3600000) {
+  if (!db) return;
+  db.prepare('DELETE FROM reply_feedback WHERE posted_at < ?').run(Date.now() - maxAgeMs);
+}
+
+export function trackAutoPost(tweetId, tokenTicker, tokenName, lang, threadSize) {
+  if (!db || !tweetId) return;
+  db.prepare(`INSERT OR IGNORE INTO auto_post_feedback(tweet_id, token_ticker, token_name, lang, thread_size, posted_at)
+    VALUES(?, ?, ?, ?, ?, ?)`).run(tweetId, tokenTicker || '', tokenName || '', lang || '', threadSize || 0, Date.now());
+}
+
+export function updateAutoPostEngagement(tweetId, likes, replies, retweets, quotes) {
+  if (!db || !tweetId) return;
+  db.prepare(`UPDATE auto_post_feedback SET likes_got=?, replies_got=?, retweets_got=?, quotes_got=?, checked_at=? WHERE tweet_id=?`)
+    .run(likes || 0, replies || 0, retweets || 0, quotes || 0, Date.now(), tweetId);
+}
+
+export function getUncheckedAutoPosts(minAgeMs = 7200000, limit = 5) {
+  if (!db) return [];
+  const cutoff = Date.now() - minAgeMs;
+  return db.prepare(`SELECT tweet_id, token_ticker, lang FROM auto_post_feedback
+    WHERE (checked_at IS NULL OR checked_at < ?) AND posted_at < ?
+    ORDER BY posted_at ASC LIMIT ?`).all(cutoff, cutoff, limit);
+}
+
+export function getAutoPostStats() {
+  if (!db) return null;
+  const row = db.prepare(`SELECT COUNT(*) as total,
+    CAST(SUM(likes_got) AS REAL) / MAX(COUNT(*), 1) as avg_likes,
+    CAST(SUM(replies_got) AS REAL) / MAX(COUNT(*), 1) as avg_replies,
+    SUM(likes_got) as total_likes, SUM(replies_got) as total_replies
+    FROM auto_post_feedback WHERE checked_at IS NOT NULL`).get();
+  return row;
+}
+
+export function getBestAutoPostTokens(minSamples = 2) {
+  if (!db) return [];
+  return db.prepare(`SELECT token_ticker, token_name, COUNT(*) as n,
+    CAST(SUM(likes_got + replies_got * 2 + retweets_got * 3) AS REAL) / MAX(COUNT(*), 1) as score
+    FROM auto_post_feedback WHERE checked_at IS NOT NULL AND token_ticker != ''
+    GROUP BY token_ticker HAVING n >= ? ORDER BY score DESC LIMIT 5`).all(minSamples);
+}
+
+export function isFollower(userId) {
+  if (!db || !userId) return false;
+  return !!db.prepare('SELECT 1 FROM followers WHERE user_id = ?').get(userId);
+}
+
+export function markFollower(userId, username) {
+  if (!db || !userId) return;
+  db.prepare('INSERT OR IGNORE INTO followers(user_id, username, discovered_at) VALUES(?, ?, ?)')
+    .run(userId, username || '', Date.now());
 }

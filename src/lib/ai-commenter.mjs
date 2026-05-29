@@ -88,7 +88,7 @@ function buildPrompt({ tweetText, lang, style, author }) {
 - Contextually appropriate to the tweet (funny, supportive, insightful, or curious)
 - No hashtags, no URLs, minimal emoji
 ${sentimentHint ? `- ${sentimentHint}\n` : ''}- End with a natural question or call-to-action that sparks engagement (what do you think?, agree?, etc.)
-- Always naturally suggest or hint at following you back at the end of every reply. In Vietnamese: "follow lại mình nha", "theo dõi lại nhé", "fl lại đi". In English: "follow back?", "follow me too", "let's connect". Keep it casual, not pushy — make it feel like a natural part of the conversation.
+- End with a natural invitation to connect — suggest building a relationship, not just following. In Vietnamese use creative phrases like: "cùng kết nối nhé", "theo dõi nhau cùng phát triển", "hãy theo dõi mình lại nhé". In English use: "let's connect", "would love to follow each other", "let's grow together", "connect with fellow traders". NEVER use the words "follow back", "fl lại", "follow lại" — those sound desperate and robotic. Make it feel like a genuine networking invitation, not a transaction. Mix it up, don't repeat the same phrase.
 - CRITICAL LANGUAGE RULE: You MUST reply in the SAME language as the tweet. Vietnamese tweet → Vietnamese reply. English tweet → English reply. This rule OVERRIDES everything else including style preferences. Never mix or switch languages.
 - ${LANG_INSTRUCTION[lang] || LANG_INSTRUCTION.en}
 - ${styleLine}

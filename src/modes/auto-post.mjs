@@ -4,7 +4,7 @@ import { waitForSlot } from '../lib/rate-limiter.mjs';
 import { sendAlert } from '../lib/telegram.mjs';
 
 export async function runAutoPostMode(cfg, log) {
-  if (typeof log !== 'function') log = console.log;
+  if (typeof log !== 'function') log = (msg) => process.stderr.write(`[${new Date().toISOString()}] ${msg}\n`);
   const modeCfg = cfg.modeE || {};
   const topics = modeCfg.topics || ['crypto alpha', 'airdrop', 'narrative', 'solana ecosystem', 'base chain'];
   const postsPerDay = modeCfg.postsPerDay || 3;

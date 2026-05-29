@@ -15,7 +15,6 @@ const RUN_LOG = 'data/run.log';
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
-  console.log(line);
   try {
     const dir = path.dirname(RUN_LOG);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });

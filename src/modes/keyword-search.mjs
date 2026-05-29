@@ -1,18 +1,28 @@
-import { searchTimeline, postTweet, favoriteTweet, followUser, unfollowUser, uploadMedia } from '../lib/twitter-http.mjs';
+import { searchTimeline, postTweet, favoriteTweet, followUser, unfollowUser, uploadMedia, fetchTweetEngagement, deleteTweet, getTweetReplies } from '../lib/twitter-http.mjs';
 import { generateComment, selectPersona } from '../lib/ai-commenter.mjs';
 import { detectLanguage } from '../lib/language.mjs';
 import { readFileSync, writeFileSync } from 'fs';
 import { scrapeTokens } from '../lib/token-scraper.mjs';
+import { pickBestToken } from '../lib/token-scorer.mjs';
+import { buildInfographicChart, downloadLogo } from '../lib/chart-builder.mjs';
+import { generateReplyImage } from '../lib/image-reply.mjs';
 import { getCommentCount, markCommented, isEngagedUser, markUserEngaged,
          seeViralTweet, getViralTweets, cleanupOldViralTweets, getViralStats,
          trackFollow, getStaleFollows, removeFollowRecord,
          isMutual, markMutual, getMutuals, getMutualCount,
          isFollowing,
          getTrendKeywords, bumpTrendWord, cleanupTrendWords,
-         getMeta, setMeta, trackMyReply, isReplyToMyComment } from '../lib/store.mjs';
+         getMeta, setMeta, trackMyReply, isReplyToMyComment,
+         trackReplyFeedback, updateReplyFeedback, getUncheckedFeedback,
+         getBestStyles, getBestPersonas, cleanupOldFeedback,
+         trackAutoPost, updateAutoPostEngagement, getUncheckedAutoPosts, getAutoPostStats,
+         isFollower, markFollower } from '../lib/store.mjs';
 import { getFriendship } from '../lib/twitter-http.mjs';
 import { waitForSlot } from '../lib/rate-limiter.mjs';
 import { sendAlert } from '../lib/telegram.mjs';
+
+const sessionCommentedIds = new Set();
+const sessionRepliedUsers = new Set();
 
 function isUserRepliedToday(username) {
   const today = new Date().toDateString();
@@ -43,6 +53,110 @@ const STYLE_HINTS = {
   'hot-take': 'Drop a bold opinion. Be slightly controversial but not offensive.',
 };
 
+function weightedPick(items, scoreKey = 'score') {
+  if (!items || !items.length) return null;
+  const total = items.reduce((s, i) => s + Math.max(i[scoreKey] || 0.1, 0.1), 0);
+  let r = Math.random() * total;
+  for (const item of items) {
+    r -= Math.max(item[scoreKey] || 0.1, 0.1);
+    if (r <= 0) return item;
+  }
+  return items[items.length - 1];
+}
+
+function pickEngagementStyleWeighted(modeCfg) {
+  if (modeCfg.feedbackLoopEnabled === false) return pickEngagementStyle();
+  const best = getBestStyles(3);
+  if (best && best.length >= 2) {
+    const chosen = weightedPick(best);
+    if (chosen) {
+      const style = chosen.engagement_style;
+      if (ENGAGEMENT_STYLES.includes(style)) return style;
+    }
+  }
+  return pickEngagementStyle();
+}
+
+function pickPersonaWeighted(tweetText, availablePersonas, modeCfg) {
+  if (modeCfg.feedbackLoopEnabled === false) return selectPersona(tweetText, availablePersonas);
+  const best = getBestPersonas(3);
+  if (best && best.length >= 2) {
+    const chosen = weightedPick(best);
+    if (chosen && availablePersonas.includes(chosen.persona)) return chosen.persona;
+  }
+  return selectPersona(tweetText, availablePersonas);
+}
+
+async function checkReplyFeedback(cfg, log) {
+  const unchecked = getUncheckedFeedback(3600000, 5);
+  if (!unchecked.length) return;
+  log(`[feedback] checking ${unchecked.length} replies...`);
+  let updated = 0;
+  for (const fb of unchecked) {
+    try {
+      const eng = await fetchTweetEngagement(fb.tweet_id, cfg.cookiesFile);
+      if (eng) {
+        updateReplyFeedback(fb.tweet_id, eng.likes, eng.replies);
+        updated++;
+        if (eng.likes > 0 || eng.replies > 0) {
+          log(`[feedback] ${fb.tweet_id} | ❤️${eng.likes} 💬${eng.replies} | style:${fb.engagement_style}`);
+        }
+      } else {
+        updateReplyFeedback(fb.tweet_id, 0, 0);
+      }
+    } catch (e) {
+      updateReplyFeedback(fb.tweet_id, 0, 0);
+    }
+    await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+  }
+  if (updated) {
+    cleanupOldFeedback();
+    const bestStyles = getBestStyles(2);
+    if (bestStyles.length) {
+      log(`[feedback] top styles: ${bestStyles.map(s => `${s.engagement_style}(${s.score.toFixed(1)})`).join(', ')}`);
+    }
+  }
+}
+
+const PEAK_SLOTS_VN = [
+  { start: 7, end: 10, label: 'morning rush' },
+  { start: 11, end: 17, label: 'lunch break' },
+  { start: 19, end: 22, label: 'evening prime' },
+];
+
+function isInPeakSlot() {
+  const h = getVietnamHour();
+  return PEAK_SLOTS_VN.find(s => h >= s.start && h < s.end) || null;
+}
+
+async function checkAutoPostFeedback(cfg, log) {
+  const unchecked = getUncheckedAutoPosts(7200000, 5);
+  if (!unchecked.length) return;
+  log(`[auto-post-fb] checking ${unchecked.length} posts...`);
+  let updated = 0;
+  for (const ap of unchecked) {
+    try {
+      const eng = await fetchTweetEngagement(ap.tweet_id, cfg.cookiesFile);
+      if (eng) {
+        updateAutoPostEngagement(ap.tweet_id, eng.likes, eng.replies, 0, 0);
+        updated++;
+        if (eng.likes > 0 || eng.replies > 0) {
+          log(`[auto-post-fb] ${ap.token_ticker} | ❤️${eng.likes} 💬${eng.replies}`);
+        }
+      } else {
+        updateAutoPostEngagement(ap.tweet_id, 0, 0, 0, 0);
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
+  }
+  if (updated) {
+    const stats = getAutoPostStats();
+    if (stats && stats.total > 0) {
+      log(`[auto-post-fb] avg ❤️${stats.avg_likes.toFixed(1)} avg 💬${stats.avg_replies.toFixed(1)} (${stats.total} posts)`);
+    }
+  }
+}
+
 function trackStat(key) {
   const today = new Date().toDateString();
   const day = getMeta('stat_day');
@@ -52,9 +166,101 @@ function trackStat(key) {
     setMeta('stat_likes', '0');
     setMeta('stat_follows', '0');
     setMeta('stat_autoposts', '0');
+    setMeta('stat_quotes', '0');
+    setMeta('stat_images', '0');
   }
   const current = parseInt(getMeta(key) || '0');
   setMeta(key, String(current + 1));
+}
+
+async function autoDeleteDuds(cfg, log) {
+  const unchecked = getUncheckedAutoPosts(6 * 3600000, 10);
+  if (!unchecked.length) return;
+  let deleted = 0;
+  for (const ap of unchecked) {
+    try {
+      const eng = await fetchTweetEngagement(ap.tweet_id, cfg.cookiesFile);
+      if (eng) {
+        updateAutoPostEngagement(ap.tweet_id, eng.likes, eng.replies, 0, 0);
+        if (eng.likes === 0 && eng.replies === 0) {
+          try {
+            await deleteTweet(ap.tweet_id, cfg.cookiesFile);
+            deleted++;
+            log(`[auto-delete] removed dud: ${ap.token_ticker} ${ap.tweet_id}`);
+          } catch (delErr) {
+            log(`[auto-delete] delete failed ${ap.tweet_id}: ${delErr.message}`);
+          }
+        }
+      } else {
+        updateAutoPostEngagement(ap.tweet_id, 0, 0, 0, 0);
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 1000 + Math.random() * 1000));
+  }
+  if (deleted) log(`[auto-delete] removed ${deleted} dud posts`);
+}
+
+async function sendEnhancedDailyReport(cfg, log) {
+  const now = new Date();
+  const hour = now.getHours();
+  const today = now.toDateString();
+  const sent = getMeta('report_sent_day');
+  if (sent === today || hour < 22) return;
+  if (hour < 22 || !cfg.telegram?.botToken) return;
+
+  const replies = parseInt(getMeta('stat_replies') || '0');
+  const likes = parseInt(getMeta('stat_likes') || '0');
+  const follows = parseInt(getMeta('stat_follows') || '0');
+  const autoposts = parseInt(getMeta('stat_autoposts') || '0');
+  const quotes = parseInt(getMeta('stat_quotes') || '0');
+  const images = parseInt(getMeta('stat_images') || '0');
+  const total = replies + likes + follows + autoposts + quotes;
+  if (total === 0) return;
+
+  try {
+    const bestStyles = getBestStyles(2);
+    const bestPersonas = getBestPersonas(2);
+    const apStats = getAutoPostStats();
+    const apTokens = getBestAutoPostTokens(2);
+    const mutualCount = getMutualCount();
+
+    let msg = `📊 *Daily Report ${today}*\n\n`;
+    msg += `*Activity*\n`;
+    msg += `💬 Replies: ${replies}\n`;
+    msg += `❤️ Likes: ${likes}\n`;
+    msg += `👥 Follows: ${follows}\n`;
+    msg += `📝 Auto-posts: ${autoposts}\n`;
+    msg += `🔁 Quote tweets: ${quotes}\n`;
+    msg += `🖼 Image replies: ${images}\n`;
+    msg += `🤝 Mutuals: ${mutualCount}\n`;
+    msg += `━━━━━━━━━━━━━\n`;
+    msg += `🔥 Total actions: ${total}\n\n`;
+
+    if (bestStyles.length) {
+      msg += `*Top Styles*\n`;
+      bestStyles.forEach(s => msg += `• ${s.engagement_style}: score ${s.score.toFixed(1)} (${s.n} replies)\n`);
+      msg += `\n`;
+    }
+
+    if (bestPersonas.length) {
+      msg += `*Top Personas*\n`;
+      bestPersonas.forEach(p => msg += `• ${p.persona.slice(0, 40)}: score ${p.score.toFixed(1)}\n`);
+      msg += `\n`;
+    }
+
+    if (apStats && apStats.total > 0) {
+      msg += `*Auto-Post Stats*\n`;
+      msg += `• ${apStats.total} posts tracked\n`;
+      msg += `• Avg ❤️ ${apStats.avg_likes.toFixed(1)} | 💬 ${apStats.avg_replies.toFixed(1)}\n`;
+      if (apTokens.length) {
+        apTokens.forEach(t => msg += `• ${t.token_ticker}: score ${t.score.toFixed(1)}\n`);
+      }
+    }
+
+    await sendAlert(cfg.telegram.botToken, cfg.telegram.chatId, msg);
+    setMeta('report_sent_day', today);
+    log('[report] enhanced daily report sent');
+  } catch (e) { log(`[report] failed: ${e.message}`); }
 }
 
 async function sendDailyReportIfTime(cfg, log) {
@@ -111,7 +317,7 @@ function getSmartDelay() {
 }
 
 export async function runKeywordSearchMode(cfg, log) {
-  if (typeof log !== 'function') log = console.log;
+  if (typeof log !== 'function') log = (msg) => process.stderr.write(`[${new Date().toISOString()}] ${msg}\n`);
   const modeCfg = cfg.modeD || {};
   const hashtags = modeCfg.hashtags || ['#Crypto', '#Bitcoin', '#Airdrop', '#Solana', '#Base'];
   const keywords = modeCfg.keywords || ['airdrop', 'bullish', 'moon', 'gem', 'alpha'];
@@ -139,6 +345,11 @@ export async function runKeywordSearchMode(cfg, log) {
   const smartConnectionsEnabled = modeCfg.smartConnectionsEnabled === true;
   const mutualCheckInterval = modeCfg.mutualCheckIntervalCycles || 5;
   const competitorReplyChance = modeCfg.competitorReplyChance || 0;
+  const quoteTweetChance = modeCfg.quoteTweetChance || 0;
+  const imageReplyChance = modeCfg.imageReplyChance || 0;
+  const imageReplyTypes = modeCfg.imageReplyTypes || ['chart'];
+  const targetUsers = modeCfg.targetUsers || [];
+  const blockedUsers = modeCfg.blockedUsers || [];
 
   let queries = [...hashtags, ...keywords];
 
@@ -190,6 +401,11 @@ export async function runKeywordSearchMode(cfg, log) {
     }
   }
 
+  const cycleNum = parseInt(getMeta('cycle_count') || '0');
+  if (cycleNum > 0 && cycleNum % 3 === 0 && modeCfg.feedbackLoopEnabled !== false) {
+    try { await checkReplyFeedback(cfg, log); } catch {}
+  }
+
   log(`[mode-D] Starting search | queries: ${queries.length} | onlyEngaged: ${onlyEngaged} | onlyVerified: ${onlyVerified} | autoLike: ${autoLike} | autoFollow: ${autoFollow} | minLikes: ${minLikes} | minReplies: ${minReplies} | minFollowers: ${minFollowers}`);
 
   cleanupOldViralTweets();
@@ -204,7 +420,14 @@ export async function runKeywordSearchMode(cfg, log) {
     log(`[viral] ${viralQueries.length} tweet queries injected at front of queue`);
   }
 
+  if (targetUsers.length) {
+    const userQueries = targetUsers.map(u => `from:@${u}`);
+    queries.unshift(...userQueries);
+    log(`[target] watching ${targetUsers.length} users: ${targetUsers.join(', ')}`);
+  }
+
   let total = 0;
+  const repliedThisCycle = new Set();
 
   for (const q of queries) {
     if (total >= maxPerCycle) break;
@@ -221,11 +444,12 @@ export async function runKeywordSearchMode(cfg, log) {
     log(`[mode-D] query "${q}" → found ${tweets.length} tweets`);
 
     if (trendSurfingEnabled && tweets.length > 0) {
-      const cryptoSigs = ['crypto', 'blockchain', 'token', 'defi', 'nft', 'sol', 'eth', 'btc', 'coin', 'chain', 'web3', 'bitcoin', 'ethereum', 'solana', 'dex', 'airdrop', 'staking', 'meme', 'layer2', 'l2', 'mainnet', 'testnet', 'wallet', 'swap', 'bridge', 'dao', 'yield', 'farming', 'base', 'basechain', 'coinbase', 'based'];
+      const cryptoSigs = ['crypto', 'blockchain', 'token', 'defi', 'nft', 'sol', 'eth', 'btc', 'coin', 'chain', 'web3', 'bitcoin', 'ethereum', 'solana', 'dex', 'airdrop', 'staking', 'meme', 'layer2', 'l2', 'mainnet', 'testnet', 'wallet', 'swap', 'bridge', 'dao', 'yield', 'farming', 'base', 'basechain', 'coinbase', 'based', 'tăng', 'giảm', 'pump', 'dump', 'hold', 'chốt', 'lời', 'lỗ', 'sàn', 'ví', 'giao dịch', 'trend', 'vốn', 'rủi', 'ro', 'phân', 'tích', 'kèo', 'thơm', 'whale', 'cá', 'mập'];
+      const STOPWORDS = new Set(['không', 'cũng', 'nhưng', 'vậy', 'này', 'đó', 'kia', 'nào', 'sao', 'đang', 'đã', 'sẽ', 'vào', 'cho', 'với', 'qua', 'của', 'là', 'có', 'một', 'được', 'mình', 'bạn', 'anh', 'em', 'tôi', 'nó', 'nhiều', 'rất', 'thì', 'nên', 'mà', 'đây', 'nhé', 'nha', 'rồi', 'nữa', 'hơn', 'thôi', 'nếu', 'khi', 'để', 'từ', 'còn', 'và', 'hay', 'vì', 'những', 'các', 'đi', 'ra', 'lên', 'bị', 'chỉ', 'thế', 'làm', 'cái', 'người', 'trong', 'về']);
       for (const t of tweets.slice(0, 10)) {
         const lowerText = (t.text || '').toLowerCase();
         if (!cryptoSigs.some(sig => lowerText.includes(sig))) continue;
-        const words = lowerText.replace(/[#@,.:;!?]/g, '').split(/\s+/).filter(w => w.length > 3 && !blacklistWords.includes(w));
+        const words = lowerText.replace(/[#@,.:;!?]/g, '').split(/\s+/).filter(w => w.length > 3 && !blacklistWords.includes(w) && cryptoSigs.some(s => s.length > 2 && w.includes(s)));
         const unique = [...new Set(words)].slice(0, 5);
         unique.forEach(w => bumpTrendWord(w));
       }
@@ -241,8 +465,13 @@ export async function runKeywordSearchMode(cfg, log) {
       if (t.isRetweet) continue;
       if (Date.now() - new Date(t.createdAt).getTime() > MAX_AGE_MS) continue;
       if (getCommentCount(t.id) >= 1) continue;
-      const isTopFunnel = !!t.inReplyToTweetId;
+      if (sessionCommentedIds.has(t.id)) {
+        log(`[mode-D] SKIP tweet ${t.id} — already commented this session`);
+        continue;
+      }
+      const isTopFunnel = !!t.inReplyToStatusId;
       const isThreadHijack = threadHijackMinReplies > 0 && isTopFunnel && (t.replyCount || 0) >= threadHijackMinReplies;
+      const isTargetQuery = q.startsWith('from:@');
       if (!isTopFunnel && !isThreadHijack && (t.likeCount || 0) < minLikes) continue;
       if (!isTopFunnel && !isThreadHijack && (t.replyCount || 0) < minReplies) continue;
       if (!isTopFunnel && !isThreadHijack && minFollowers > 0 && (t.author_followers_count || 0) < minFollowers) continue;
@@ -256,7 +485,7 @@ export async function runKeywordSearchMode(cfg, log) {
         const lower = (t.text || '').toLowerCase();
         if (blacklistWords.some(w => lower.includes(w.toLowerCase()))) continue;
       }
-      if (q.length > 2 && !(t.text || '').toLowerCase().includes(q.toLowerCase())) continue;
+      if (!isTargetQuery && q.length > 2 && !(t.text || '').toLowerCase().includes(q.toLowerCase())) continue;
 
       const followers = t.author_followers_count || 0;
       const isHighFollower = followers >= highFollowerMin;
@@ -264,13 +493,17 @@ export async function runKeywordSearchMode(cfg, log) {
 
       if (isThreadHijack) {
         if (!isThreadHijackSeen) { isThreadHijackSeen = true; }
+        t._isTarget = isTargetQuery;
         threadHijack.push(t);
       } else if (isMutualBoost) {
+        t._isTarget = isTargetQuery;
         if (isHighFollower) highFollower.unshift(t);
         else regular.unshift(t);
       } else if (isHighFollower) {
+        t._isTarget = isTargetQuery;
         highFollower.push(t);
       } else {
+        t._isTarget = isTargetQuery;
         regular.push(t);
       }
     }
@@ -279,6 +512,11 @@ export async function runKeywordSearchMode(cfg, log) {
 
     for (const t of bucket) {
       if (total >= maxPerCycle) break;
+
+      if (repliedThisCycle.has(t.author)) {
+        log(`[mode-D] SKIP @${t.author} — already replied this cycle`);
+        continue;
+      }
 
       const isViralCandidate = t.replyCount >= 50;
       const followers = t.author_followers_count || 0;
@@ -303,6 +541,34 @@ export async function runKeywordSearchMode(cfg, log) {
         continue;
       }
 
+      if (blockedUsers.length && blockedUsers.includes(t.author)) {
+        log(`[mode-D] SKIP @${t.author} — blocked user`);
+        continue;
+      }
+
+      if (modeCfg.skipFollowing !== false && t.author_user_id && isFollowing(t.author_user_id)) {
+        log(`[mode-D] SKIP @${t.author} — already following`);
+        continue;
+      }
+
+      let followerCheck = false;
+      if (modeCfg.skipFollowers === true && t.author) {
+        if (t.author_user_id && isFollower(t.author_user_id)) {
+          followerCheck = true;
+          log(`[mode-D] SKIP @${t.author} — already follows you (cached)`);
+          continue;
+        }
+        try {
+          const fs = await getFriendship(t.author, cfg.cookiesFile);
+          if (fs?.relationship?.source?.followed_by) {
+            followerCheck = true;
+            if (t.author_user_id) markFollower(t.author_user_id, t.author);
+            log(`[mode-D] SKIP @${t.author} — already follows you`);
+            continue;
+          }
+        } catch {}
+      }
+
       if (isViralCandidate) {
         seeViralTweet(t.id, t.replyCount || 0);
       }
@@ -325,12 +591,18 @@ export async function runKeywordSearchMode(cfg, log) {
           }
         }
 
-        const persona = selectPersona(t.text, personas);
-        const engagementStyle = pickEngagementStyle();
+        const persona = pickPersonaWeighted(t.text, personas, modeCfg);
+        const engagementStyle = pickEngagementStyleWeighted(modeCfg);
         const styleHint = STYLE_HINTS[engagementStyle] || '';
         const alreadyFollowed = t.author_user_id && isFollowing(t.author_user_id);
         const noFollowHint = alreadyFollowed ? ' DO NOT ask to follow back — you already follow this person.' : '';
-        const combinedStyle = [modeCfg.style || cfg.ai?.style || '', persona, styleHint, noFollowHint].filter(Boolean).join('. ');
+        const isQuoteTweet = quoteTweetChance > 0 && Math.random() < quoteTweetChance;
+
+        let combinedStyle = [modeCfg.style || cfg.ai?.style || '', persona, styleHint, noFollowHint].filter(Boolean).join('. ');
+        if (isQuoteTweet) {
+          combinedStyle += '. This is a QUOTE TWEET — be bold, share your own spicy take. Add real value that makes people want to engage.';
+        }
+
         if (alreadyFollowed) log(`[mode-D] @${t.author} already followed — no follow-back prompt`);
         const comment = await generateComment({
           tweetText: t.text,
@@ -345,11 +617,41 @@ export async function runKeywordSearchMode(cfg, log) {
           continue;
         }
 
-        const replyResult = await postTweet(comment, cfg.cookiesFile, { replyToId: t.id });
+        let mediaIds = [];
+        if (imageReplyChance > 0 && Math.random() < imageReplyChance && !isQuoteTweet) {
+          try {
+            const imgType = imageReplyTypes[Math.floor(Math.random() * imageReplyTypes.length)] || 'chart';
+            const imgBuf = await generateReplyImage(t.text, imgType);
+            if (imgBuf && imgBuf.length > 500) {
+              const upload = await uploadMedia(imgBuf, cfg.cookiesFile);
+              if (upload?.media_id_string) {
+                mediaIds = [upload.media_id_string];
+                log(`[mode-D] attached ${imgType} image to reply`);
+              }
+            }
+          } catch (imgErr) { log(`[mode-D] image gen failed: ${imgErr.message}`); }
+        }
+
+        const postOpts = {};
+        if (isQuoteTweet) {
+          postOpts.quoteTweetId = t.id;
+        } else {
+          postOpts.replyToId = t.id;
+        }
+        if (mediaIds.length) postOpts.mediaIds = mediaIds;
+
+        const replyResult = await postTweet(comment, cfg.cookiesFile, postOpts);
         markCommented(t.id, t.author || '');
-        if (replyResult && replyResult !== 'ok') trackMyReply(replyResult, t.id);
+        if (replyResult && replyResult !== 'ok') {
+          trackMyReply(replyResult, t.id);
+          trackReplyFeedback(replyResult, engagementStyle, persona);
+        }
         trackStat('stat_replies');
+        if (isQuoteTweet) trackStat('stat_quotes');
+        if (mediaIds.length) trackStat('stat_images');
         markUserRepliedToday(t.author);
+        repliedThisCycle.add(t.author);
+        sessionCommentedIds.add(t.id);
 
         if (autoFollow && t.author_user_id) {
           try {
@@ -369,8 +671,11 @@ export async function runKeywordSearchMode(cfg, log) {
         const hijackTag = isHijack ? ' [THREAD-HIJACK]' : '';
         const mutualTag = isMutualReply ? ' [MUTUAL]' : '';
         const competitorTag = isCompetitor ? ' [COMPETITOR]' : '';
+        const quoteTag = isQuoteTweet ? ' [QUOTE]' : '';
+        const imageTag = mediaIds.length ? ' [IMG]' : '';
+        const targetTag = t._isTarget ? ' [TARGET]' : '';
         const detectedLang = detectLanguage(t.text);
-        log(`[mode-D] replied${highFollowerTag}${viralTag}${hijackTag}${mutualTag}${competitorTag} ${t.id} | lang: ${detectedLang} | q: ${q} | user: @${t.author}${autoFollow ? ' | followed: yes' : ''}${persona ? ' | persona: ' + persona.slice(0, 30) : ''} | "${comment.slice(0, 80)}"`);
+        log(`[mode-D] replied${highFollowerTag}${viralTag}${hijackTag}${mutualTag}${competitorTag}${quoteTag}${imageTag}${targetTag} ${t.id} | lang: ${detectedLang} | q: ${q} | user: @${t.author}${autoFollow ? ' | followed: yes' : ''}${persona ? ' | persona: ' + persona.slice(0, 30) : ''} | style: ${engagementStyle} | "${comment.slice(0, 80)}"`);
 
         if (cfg.telegram?.botToken) {
           await sendAlert(cfg.telegram.botToken, cfg.telegram.chatId,
@@ -392,6 +697,45 @@ export async function runKeywordSearchMode(cfg, log) {
           }
         }
 
+        if (!t.inReplyToStatusId && modeCfg.threadReplies !== false && total < maxPerCycle) {
+          try {
+            const replies = await getTweetReplies(t.id, cfg.cookiesFile, 10);
+            const candidates = replies.filter(r =>
+              r?.id && r?.author && r.author !== t.author &&
+              !sessionCommentedIds.has(r.id) &&
+              getCommentCount(r.id) < 1 &&
+              !repliedThisCycle.has(r.author) &&
+              !isUserRepliedToday(r.author)
+            );
+            const pick = candidates.slice(0, 3);
+            for (const rt of pick) {
+              if (total >= maxPerCycle) break;
+              try {
+                await waitForSlot(cfg, log);
+                const rComment = await generateComment({
+                  tweetText: rt.text, lang: 'auto',
+                  style: (modeCfg.style || cfg.ai?.style || '') + '. Reply to someone in a thread.',
+                  ai: cfg.ai, author: rt.author
+                });
+                if (rComment && rComment.length >= 3) {
+                  const rResult = await postTweet(rComment, cfg.cookiesFile, { replyToId: rt.id });
+                  markCommented(rt.id, rt.author || '');
+                  if (rResult && rResult !== 'ok') trackMyReply(rResult, rt.id);
+                  sessionCommentedIds.add(rt.id);
+                  repliedThisCycle.add(rt.author);
+                  markUserRepliedToday(rt.author);
+                  trackStat('stat_replies');
+                  total++;
+                  log(`[mode-D] thread reply ${rt.id} | @${rt.author} | \"${rComment.slice(0, 50)}\"`);
+                }
+                if (autoLike) { try { await favoriteTweet(rt.id, cfg.cookiesFile); } catch {} }
+                await new Promise(r => setTimeout(r, 3000 + Math.random() * 4000));
+              } catch (rErr) { log(`[mode-D] thread reply error: ${rErr.message}`); }
+            }
+            if (pick.length) log(`[mode-D] thread replies: ${pick.length} added to ${t.id}`);
+          } catch (thErr) { log(`[mode-D] thread fetch error: ${thErr.message}`); }
+        }
+
         await new Promise(r => setTimeout(r, getSmartDelay()));
       } catch (e) {
         log(`[mode-D] reply error ${t.id}: ${e.message}`);
@@ -401,7 +745,8 @@ export async function runKeywordSearchMode(cfg, log) {
 
   log(`[mode-D] Cycle finished. Replies: ${total}`);
 
-  sendDailyReportIfTime(cfg, log).catch(() => {});
+  try { await autoDeleteDuds(cfg, log); } catch {}
+  sendEnhancedDailyReport(cfg, log).catch(() => {});
 
   try {
     const viralStats = getViralStats();
@@ -437,16 +782,26 @@ export async function runKeywordSearchMode(cfg, log) {
 
   if (enableAutoPost) {
     try {
-      const intervalMs = (modeCfg.autoPostIntervalMinutes || 240) * 60 * 1000;
       const maxPosts = modeCfg.autoPostsPerDay || 4;
-      const lastTs = parseInt(getMeta('last_auto_post_ts') || '0');
       const postCount = parseInt(getMeta('auto_post_count') || '0');
       const dayReset = parseInt(getMeta('auto_post_day') || '0');
       const today = new Date().toDateString();
       const newDay = today !== new Date(dayReset).toDateString();
       if (newDay) { setMeta('auto_post_count', '0'); setMeta('auto_post_day', today); }
       const currentCount = newDay ? 0 : postCount;
-      if (currentCount < maxPosts && Date.now() - lastTs >= intervalMs) {
+
+      const lastSlot = getMeta('last_auto_post_slot') || '';
+      const peak = isInPeakSlot();
+      const slotKey = peak ? `${peak.start}-${peak.end}` : 'offpeak';
+
+      const hourSinceLast = parseInt(getMeta('last_auto_post_ts') || '0');
+      const minGap = peak ? 90 * 60 * 1000 : 180 * 60 * 1000;
+
+      if (currentCount < maxPosts && Date.now() - hourSinceLast >= minGap && peak && slotKey !== lastSlot) {
+        setMeta('last_auto_post_slot', slotKey);
+
+        checkAutoPostFeedback(cfg, log).catch(() => {});
+
         const lang = currentCount < 2 ? 'en' : 'vi';
         const langRule = lang === 'vi' ? 'VIET TIENG VIET.' : 'Write in ENGLISH.';
         const toneRule = lang === 'vi' ? 'giong chuyen gia crypto VN, tu nhien, gan gui' : 'expert crypto analyst, sharp but natural';
@@ -455,11 +810,11 @@ export async function runKeywordSearchMode(cfg, log) {
         try {
           const freshTokens = await scrapeTokens({ minMC: 100_000, maxMC: 7_000_000, minVolRatio: 0.03 });
           if (freshTokens && freshTokens.length) {
-            const withMC = freshTokens.filter(t => t.mcVal > 0);
-            const pick = withMC.length ? withMC : freshTokens;
-            tokenData = pick[Math.floor(Math.random() * pick.length)];
-            tokenSource = tokenData.source === 'geckoterminal' ? 'GeckoTerminal' : tokenData.source === 'bankr' ? 'Bankr.bot' : tokenData.source === 'clanker' ? 'Clanker.world' : tokenData.source || 'DEX';
-            try { writeFileSync('data/bankr-tokens.json', JSON.stringify(pick.slice(0, 25).map(t => ({ ticker: t.ticker, name: t.name, mc: t.mc, vol: t.vol })))); } catch {}
+            tokenData = await pickBestToken(freshTokens, log);
+            if (tokenData) {
+              tokenSource = tokenData.source === 'geckoterminal' ? 'GeckoTerminal' : tokenData.source === 'bankr' ? 'Bankr.bot' : tokenData.source === 'clanker' ? 'Clanker.world' : tokenData.source || 'DEX';
+            }
+            try { writeFileSync('data/bankr-tokens.json', JSON.stringify(freshTokens.slice(0, 25).map(t => ({ ticker: t.ticker, name: t.name, mc: t.mc, vol: t.vol })))); } catch {}
           }
         } catch {}
         if (!tokenData) {
@@ -496,121 +851,15 @@ export async function runKeywordSearchMode(cfg, log) {
         let mediaIds = [];
         if (tokenData) {
           try {
-            const parseNum = (s) => { const n = parseFloat(s.replace(/[$,]/g,'')); return s.includes('K') ? n*1e3 : s.includes('M') ? n*1e6 : s.includes('B') ? n*1e9 : n; };
-            const mcVal = parseNum(tokenData.mc);
-            const volVal = parseNum(tokenData.vol);
-            const hours = Array.from({length: 24}, (_, i) => `${23-i}h`);
-
-            let realPrice = null, realChange24 = 0;
-            if (tokenData.address) {
-              try {
-                const dexData = await retry(() => new Promise((resolve, reject) => {
-                  https.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenData.address}`, (res) => {
-                    let raw = ''; res.on('data', c => raw += c);
-                    res.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { reject(e); } });
-                  }).on('error', reject);
-                }), 2, 1500);
-                const bestPair = (dexData?.pairs || []).sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0))[0];
-                if (bestPair) {
-                  realPrice = parseFloat(bestPair.priceUsd) || null;
-                  realChange24 = parseFloat(bestPair.priceChange?.h24) || 0;
-                }
-              } catch {}
+            const { buffer: chartBuf } = await buildInfographicChart(tokenData);
+            if (chartBuf && chartBuf.length > 1000) {
+              const upload = await uploadMedia(chartBuf, cfg.cookiesFile);
+              if (upload?.media_id_string) mediaIds = [upload.media_id_string];
             }
-
-            const priceBase = realPrice ? realPrice / (1 + realChange24/100) : Math.max(mcVal / 1e9 * 0.01, 0.00001);
-            const priceEnd = realPrice || priceBase * (1 + (Math.random() - 0.45) * 0.3);
-            const isUp = priceEnd >= priceBase;
-            const priceData = [];
-            for (let i = 0; i < 24; i++) {
-              const t = i / 23;
-              const base = priceBase + (priceEnd - priceBase) * t;
-              const noise = (Math.random() - 0.48) * priceBase * 0.06;
-              priceData.push(Math.max(base + noise, priceBase * 0.6));
-            }
-            const lineColor = isUp ? '#00ffcc' : '#ff4466';
-            const glowColor = isUp ? 'rgba(0,255,204,0.08)' : 'rgba(255,68,102,0.08)';
-            const fillColor = isUp ? 'rgba(0,255,204,0.12)' : 'rgba(255,68,102,0.12)';
-            const volData = Array.from({length: 24}, () => volVal > 0 ? volVal * (0.01 + Math.random() * 0.08) : mcVal * 0.001 * (0.01 + Math.random() * 0.08));
-            const ticker = tokenData.ticker || '$TOKEN';
-
-            const chartCfg = {
-              type: 'bar',
-              data: {
-                labels: hours,
-                datasets: [
-                  { type: 'line', label: 'Price', data: priceData, borderColor: lineColor, backgroundColor: fillColor, fill: true, borderWidth: 2.5, pointRadius: 0, pointHoverRadius: 5, pointHoverBackgroundColor: lineColor, pointHoverBorderColor: '#fff', pointHoverBorderWidth: 2, tension: 0.35, yAxisID: 'y', order: 1 },
-                  { type: 'line', label: 'Glow', data: priceData, borderColor: glowColor, backgroundColor: 'transparent', fill: false, borderWidth: 8, pointRadius: 0, tension: 0.35, yAxisID: 'y', order: 0 },
-                  { type: 'bar', label: 'Volume', data: volData, backgroundColor: isUp ? 'rgba(0,255,204,0.12)' : 'rgba(255,68,102,0.10)', borderColor: isUp ? 'rgba(0,255,204,0.25)' : 'rgba(255,68,102,0.20)', borderWidth: 1, borderRadius: 2, yAxisID: 'y1', order: 2 }
-                ]
-              },
-              options: {
-                responsive: false,
-                plugins: {
-                  legend: { display: false },
-                  title: { display: false },
-                  tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(10,10,30,0.95)', titleColor: '#aaa', bodyColor: '#fff', borderColor: lineColor, borderWidth: 1, cornerRadius: 6 }
-                },
-                scales: {
-                  x: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#555', font: { size: 10, weight: 'bold' }, maxTicksLimit: 6, callback: 'function(v,i){return i%6===0?this.getLabelForValue(v):\"\"}' } },
-                  y: { position: 'right', grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#999', font: { size: 10 }, callback: 'function(v){return\"$\"+v.toFixed(v<0.001?7:v<0.01?5:3)}' } },
-                  y1: { position: 'left', grid: { display: false }, ticks: { color: 'rgba(255,255,255,0.2)', font: { size: 9 }, callback: 'function(v){return v>=1e6?\"$\"+(v/1e6).toFixed(1)+\"M\":v>=1e3?\"$\"+(v/1e3).toFixed(1)+\"K\":\"$\"+v.toFixed(0)}' } }
-                }
-              },
-              layout: { padding: { top: 50, right: 80, bottom: 15, left: 15 } }
-            };
-
-            const revETH = tokenData.revenue ? parseFloat(tokenData.revenue) : null;
-            const revStr = revETH ? ` | ${revETH.toFixed(1)} WETH/wk` : '';
-
-            const pctChange = Math.abs((priceEnd - priceBase) / priceBase * 100).toFixed(1);
-            const realTag = realPrice ? ' ◆ DEX' : '';
-            const badgeColor = isUp ? '#00ffcc' : '#ff4466';
-            const overlays = [{
-              type: 'textBlock',
-              x: 14, y: 10,
-              text: `${ticker}  ${tokenData.name}\nMC: ${tokenData.mc}  |  24h Vol: ${tokenData.vol}${revStr}\n${isUp ? '▲' : '▼'} ${pctChange}% 24h${realTag}`,
-              color: '#fff',
-              fontFamily: 'monospace',
-              fontSize: 14,
-              lineHeight: 1.5
-            }, {
-              type: 'rectangle',
-              x: 650, y: 10,
-              width: 85, height: 30,
-              color: badgeColor,
-              opacity: 0.15,
-              borderRadius: 6
-            }, {
-              type: 'textBlock',
-              x: 658, y: 14,
-              text: `${isUp ? '▲' : '▼'} ${pctChange}%`,
-              color: badgeColor,
-              fontFamily: 'monospace',
-              fontSize: 15,
-              bold: true
-            }];
-
-            const chartUrl = `https://quickchart.io/chart?w=900&h=500&b=%2313131d&f=png&devicePixelRatio=2&c=${encodeURIComponent(JSON.stringify(chartCfg))}&encoding=url&post=1&overlay=${encodeURIComponent(JSON.stringify(overlays))}`;
-            const https = await import('https');
-            const imgBuf = await retry(() => new Promise((resolve, reject) => {
-              https.get(chartUrl, (res) => {
-                if (res.statusCode !== 200) { reject(new Error(`chart HTTP ${res.statusCode}`)); return; }
-                const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve(Buffer.concat(chunks)));
-              }).on('error', reject);
-            }), 2, 2000);
-            if (!imgBuf || imgBuf.length < 1000) throw new Error('chart too small');
-            const upload = await uploadMedia(imgBuf, cfg.cookiesFile);
-            if (upload?.media_id_string) mediaIds = [upload.media_id_string];
 
             if (tokenData.img) {
               try {
-                const logoBuf = await new Promise((resolve, reject) => {
-                  https.get(tokenData.img, (res) => {
-                    if (res.statusCode !== 200) { reject(new Error(`logo HTTP ${res.statusCode}`)); return; }
-                    const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve(Buffer.concat(chunks)));
-                  }).on('error', reject);
-                });
+                const logoBuf = await downloadLogo(tokenData.img);
                 if (logoBuf && logoBuf.length > 500) {
                   const logoUpload = await uploadMedia(logoBuf, cfg.cookiesFile);
                   if (logoUpload?.media_id_string) mediaIds.push(logoUpload.media_id_string);
@@ -635,7 +884,12 @@ export async function runKeywordSearchMode(cfg, log) {
         const wordCount = tweets.reduce((c, p) => c + p.split(/\s+/).length, 0);
         setMeta('last_auto_post_ts', String(Date.now()));
         setMeta('auto_post_count', String(currentCount + 1));
-        log(`[auto-post] #${currentCount + 1}/${maxPosts} | lang: ${lang} | token: ${tokenData?.ticker || 'N/A'} | thread: ${posted} tweets | ~${wordCount} words${mediaIds.length ? ' | media: ' + mediaIds.length : ''}`);
+
+        if (lastId && tokenData) {
+          trackAutoPost(lastId, tokenData.ticker, tokenData.name, lang, tweets.length);
+        }
+
+        log(`[auto-post] #${currentCount + 1}/${maxPosts} | lang: ${lang} | token: ${tokenData?.ticker || 'N/A'} | thread: ${posted} tweets | ~${wordCount} words${mediaIds.length ? ' | media: ' + mediaIds.length : ''}${peak ? ' | slot: ' + peak.label : ''}`);
         trackStat('stat_autoposts');
 
         if (cfg.telegram?.botToken) {

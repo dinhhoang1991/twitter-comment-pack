@@ -219,6 +219,10 @@ function parseTweetEntry(entry) {
     author_followers_count: followersCount,
     author_verified: verified,
     author_created_at: authorCreatedAt,
+    likeCount: legacy.favorite_count || 0,
+    replyCount: legacy.reply_count || 0,
+    retweetCount: legacy.retweet_count || 0,
+    quoteCount: legacy.quote_count || 0,
   };
 }
 
@@ -238,6 +242,9 @@ export async function postTweet(text, cookiesFilePath, options = {}) {
   };
   if (options.replyToId) {
     variables.reply = { in_reply_to_tweet_id: options.replyToId, exclude_reply_user_ids: [] };
+  }
+  if (options.quoteTweetId) {
+    variables.quote_tweet_id = options.quoteTweetId;
   }
 
   const payload = JSON.stringify({ variables, features: TWEET_FEATURES, queryId });
@@ -452,25 +459,37 @@ export async function unfollowUser(userId, cookiesFilePath) {
 }
 
 export async function getFriendship(username, cookiesFilePath) {
-  const apiPath = `/i/api/1.1/friendships/show.json?screen_name=${encodeURIComponent(username)}`;
-  const { cookieStr, ct0 } = readCookies(cookiesFilePath);
-  const ct = await getClientTransaction();
-  const txId = await ct.generateTransactionId('GET', apiPath);
-  const headers = {
-    authorization: BEARER,
-    cookie: cookieStr,
-    'x-csrf-token': ct0,
-    'x-client-transaction-id': txId,
-    'x-twitter-active-user': 'yes',
-    'x-twitter-auth-type': 'OAuth2Session',
-    'user-agent': UA,
-    accept: '*/*',
-    referer: 'https://x.com/',
-    origin: 'https://x.com',
-  };
+  const queryId = 'xc8f1g7BYqr6VTzTbvNlGw';
+  const variables = JSON.stringify({ screen_name: username, withSafetyModeUserFields: true });
+  const features = JSON.stringify({
+    hidden_profile_subscriptions_enabled: true,
+    rweb_tipjar_consumption_enabled: true,
+    responsive_web_graphql_exclude_directive_enabled: true,
+    verified_phone_label_enabled: false,
+    subscriptions_verification_info_is_identity_verified_enabled: true,
+    subscriptions_verification_info_verified_since_enabled: true,
+    highlights_tweets_tab_ui_enabled: true,
+    responsive_web_twitter_article_notes_tab_enabled: true,
+    subscriptions_feature_can_gift_premium: true,
+    creator_subscriptions_tweet_preview_api_enabled: true,
+    responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
+    responsive_web_graphql_timeline_navigation_enabled: true,
+  });
+  const apiPath = `/i/api/graphql/${queryId}/UserByScreenName?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
+  const headers = await makeHeaders('GET', apiPath, cookiesFilePath);
   const result = await httpRequest('GET', 'x.com', apiPath, headers);
   if (result.status !== 200) return null;
-  return JSON.parse(result.body);
+  const data = JSON.parse(result.body);
+  const user = data?.data?.user?.result;
+  if (!user) return null;
+  return {
+    relationship: {
+      source: {
+        followed_by: user.legacy?.followed_by || false,
+        following: user.legacy?.following || false,
+      }
+    }
+  };
 }
 
 export async function uploadMedia(imageBuffer, cookiesFilePath) {
@@ -521,4 +540,85 @@ async function httpRequestRaw(method, host, path, headers, body) {
     req.write(body);
     req.end();
   });
+}
+
+export async function fetchTweetEngagement(tweetId, cookiesFilePath) {
+  const queryId = '0hWvDhmW8YQ-S_ib3AZIrQ';
+  const variables = JSON.stringify({
+    focalTweetId: tweetId,
+    with_rux_injections: false,
+    rankingMode: 'Relevance',
+    includePromotedContent: false,
+    withCommunity: true,
+    withQuickPromoteEligibilityTweetFields: true,
+    withBirdwatchNotes: false,
+    withVoice: false,
+  });
+  const features = JSON.stringify(TWEET_FEATURES);
+  const apiPath = `/i/api/graphql/${queryId}/TweetDetail?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
+  const headers = await makeHeaders('GET', apiPath, cookiesFilePath);
+  const result = await httpRequest('GET', 'x.com', apiPath, headers);
+  if (result.status !== 200) return null;
+  try {
+    const data = JSON.parse(result.body);
+    const instructions = data?.data?.threaded_conversation_with_injections_v2?.instructions || [];
+    for (const instr of instructions) {
+      if (instr.type !== 'TimelineAddEntries') continue;
+      for (const e of instr.entries || []) {
+        if (e.content?.entryType !== 'TimelineTimelineItem') continue;
+        const tweet = parseTweetEntry(e);
+        if (tweet && tweet.id === tweetId) {
+          return { likes: tweet.likeCount || 0, replies: tweet.replyCount || 0 };
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+export async function deleteTweet(tweetId, cookiesFilePath) {
+  const queryId = 'VaenaVgh5q5ih7kvyVjgtg';
+  const apiPath = `/i/api/graphql/${queryId}/DeleteTweet`;
+  const headers = await makeHeaders('POST', apiPath, cookiesFilePath);
+  const payload = JSON.stringify({ variables: { tweet_id: tweetId, dark_request: false }, queryId });
+  const result = await httpRequest('POST', 'x.com', apiPath, headers, payload);
+  if (result.status !== 200) throw new Error(`DeleteTweet failed (${result.status}): ${result.body.slice(0, 100)}`);
+  return true;
+}
+
+export async function getTweetReplies(tweetId, cookiesFilePath, maxReplies = 10) {
+  const queryId = '0hWvDhmW8YQ-S_ib3AZIrQ';
+  const variables = JSON.stringify({
+    focalTweetId: tweetId,
+    with_rux_injections: false,
+    rankingMode: 'Relevance',
+    includePromotedContent: false,
+    withCommunity: true,
+    withQuickPromoteEligibilityTweetFields: true,
+    withBirdwatchNotes: false,
+    withVoice: false,
+  });
+  const features = JSON.stringify(TWEET_FEATURES);
+  const apiPath = `/i/api/graphql/${queryId}/TweetDetail?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
+  const headers = await makeHeaders('GET', apiPath, cookiesFilePath);
+  const result = await httpRequest('GET', 'x.com', apiPath, headers);
+  if (result.status !== 200) return [];
+  try {
+    const data = JSON.parse(result.body);
+    const instructions = data?.data?.threaded_conversation_with_injections_v2?.instructions || [];
+    const replies = [];
+    for (const instr of instructions) {
+      if (instr.type !== 'TimelineAddEntries') continue;
+      for (const e of instr.entries || []) {
+        if (e.content?.entryType !== 'TimelineTimelineItem') continue;
+        const tweet = parseTweetEntry(e);
+        if (tweet && tweet.id !== tweetId && tweet.inReplyToStatusId === tweetId) {
+          replies.push(tweet);
+          if (replies.length >= maxReplies) break;
+        }
+      }
+      if (replies.length >= maxReplies) break;
+    }
+    return replies;
+  } catch { return []; }
 }
